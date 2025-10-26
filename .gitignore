@@ -1,0 +1,8 @@
+#pycharm ide 설정폴더
+.idea
+
+# 환경 변수 파일
+.env
+
+
+apiTest.py
