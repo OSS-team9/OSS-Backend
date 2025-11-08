@@ -1,5 +1,7 @@
 ## API 엔드포인트
 
+### 호스팅 링크 : https://hajun0827.pythonanywhere.com/
+
 ### 1. `POST /login/google`
 
 * **설명:** Google 로그인을 처리하고 **(필요시 자동 회원가입)**, 서버 전용 JWT를 발급합니다.
