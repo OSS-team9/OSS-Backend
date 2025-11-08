@@ -1,93 +1,124 @@
 import os
 from flask import Flask, jsonify, request
 from flask_mysqldb import MySQL
-from flask_bcrypt import Bcrypt
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
+from dotenv import load_dotenv
 
-# 초기화
+# Google 토큰 검증 라이브러리
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
+
+# .env 파일 로드
+load_dotenv()
+
+# --- 1. 초기화 ---
 app = Flask(__name__)
-bcrypt = Bcrypt(app)
 jwt = JWTManager(app)
 
-# db 설정
+# --- 2. 설정 ---
+# DB 설정
 app.config['MYSQL_HOST'] = os.getenv('MYSQL_HOST')
 app.config['MYSQL_USER'] = os.getenv('MYSQL_USER')
 app.config['MYSQL_PASSWORD'] = os.getenv('MYSQL_PASSWORD')
 app.config['MYSQL_DB'] = os.getenv('MYSQL_DB')
+app.config['MYSQL_CURSORCLASS'] = 'DictCursor'  # 결과를 딕셔너리로 받음
+
+# JWT 설정
 app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY')
 
-app.config['MYSQL_CURSORCLASS'] = 'DictCursor' # 결과를 딕셔너리 형태로 받음
+# Google Client ID 설정
+GOOGLE_CLIENT_ID = os.getenv('GOOGLE_CLIENT_ID')
 
-
-
-
+# 확장 프로그램 초기화
 mysql = MySQL(app)
+
+
+# --- 3. API 엔드포인트 ---
 
 @app.route('/')
 def home():
-    return jsonify({"msg": "API 서버가 정상 동작 중입니다."})
+    return jsonify({"msg": "Google 로그인 API 서버입니다."})
 
-# [POST] /register : 회원가입
-@app.route('/register', methods=['POST'])
-def register():
+
+# [POST] /login/google : 구글 로그인 (회원가입/로그인 통합)
+@app.route('/login/google', methods=['POST'])
+def login_google():
+    """
+    프론트엔드에서 받은 Google ID 토큰을 검증하고,
+    사용자가 없으면 자동 회원가입, 있으면 로그인 처리 후
+    우리 앱의 자체 JWT 토큰을 발급합니다.
+    """
+
+    # 1. 프론트엔드에서 보낸 Google ID 토큰 받기
     data = request.get_json()
-    username = data.get('username')
-    password = data.get('password')
+    google_token = data.get('google_token')
 
-    if not username or not password:
-        return jsonify({"error": "사용자 이름과 비밀번호를 모두 입력해야 합니다."}), 400
+    if not google_token:
+        return jsonify({"error": "Google 토큰이 없습니다."}), 400
 
-    # 비밀번호 해싱
-    hashed_password = bcrypt.generate_password_hash(password).decode('utf-8')
+    if not GOOGLE_CLIENT_ID:
+        return jsonify({"error": "서버에 Google Client ID가 설정되지 않았습니다."}), 500
 
     try:
-        # DB에 사용자 저장
+        # 2. Google 토큰 검증
+        id_info = id_token.verify_oauth2_token(
+            google_token,
+            google_requests.Request(),
+            GOOGLE_CLIENT_ID
+        )
+
+        # 3. 토큰에서 사용자 정보 추출
+        google_id = id_info['sub']  # 구글 고유 ID
+        email = id_info['email']
+        full_name = id_info.get('name')
+
+        # 4. DB에서 사용자 조회
         cur = mysql.connection.cursor()
-        cur.execute("INSERT INTO users(username, password) VALUES (%s, %s)", (username, hashed_password))
-        mysql.connection.commit()
+        cur.execute("SELECT * FROM users WHERE google_id = %s", [google_id])
+        user = cur.fetchone()
+
+        if not user:
+            # 5-A. 신규 사용자 -> 자동 회원가입
+            print(f"새 사용자 가입: {email}")
+            cur.execute(
+                "INSERT INTO users (google_id, email, full_name) VALUES (%s, %s, %s)",
+                (google_id, email, full_name)
+            )
+            mysql.connection.commit()
+            user_identity = email
+
+        else:
+            # 5-B. 기존 사용자 -> 로그인
+            print(f"기존 사용자 로그인: {user['email']}")
+            user_identity = user['email']
+
         cur.close()
 
+        # 6. 인증 성공 -> 우리 앱의 JWT 토큰 발급
+        #    (identity는 우리 DB의 email 사용)
+        access_token = create_access_token(identity=user_identity)
+
+        return jsonify(access_token=access_token, user_email=user_identity), 200
+
+    except ValueError as e:
+        # 토큰 유효하지 않거나 만료된 경우
+        return jsonify({"error": "Google 토큰이 유효하지 않습니다.", "details": str(e)}), 401
     except Exception as e:
-        # 중복된 사용자 이름 처리
-        if '1062' in str(e):
-             return jsonify({"error": "이미 존재하는 사용자 이름입니다."}), 409
-        return jsonify({"error": "데이터베이스 오류: " + str(e)}), 500
+        return jsonify({"error": "서버 내부 오류가 발생했습니다.", "details": str(e)}), 500
 
-    return jsonify({"msg": f"'{username}' 사용자 가입 성공!"}), 201
 
-# [POST] /login : 로그인 및 토큰 발급
-@app.route('/login', methods=['POST'])
-def login():
-    data = request.get_json()
-    username = data.get('username')
-    password = data.get('password')
-
-    if not username or not password:
-        return jsonify({"error": "사용자 이름과 비밀번호를 모두 입력해야 합니다."}), 400
-
-    # DB에서 사용자 정보 조회
-    cur = mysql.connection.cursor()
-    cur.execute("SELECT * FROM users WHERE username = %s", [username])
-    user = cur.fetchone()
-    cur.close()
-
-    #사용자 확인 및 비밀번호 검증
-    if user and bcrypt.check_password_hash(user['password'], password):
-        # 비밀번호 일치 시 토큰 생성
-        # 'identity'는 토큰의 주인을 식별할 수 있는 값 (여기서는 username 사용)
-        access_token = create_access_token(identity=username)
-        return jsonify(access_token=access_token), 200
-    else:
-        return jsonify({"error": "잘못된 사용자 이름 또는 비밀번호입니다."}), 401
-
-# [GET] /protected : 인증이 필요한 보호된 라우트
+# [GET] /protected : *우리 앱의* JWT로 보호되는 엔드포인트
 @app.route('/protected', methods=['GET'])
-@jwt_required()  # 이 데코레이터가 헤더에 유효한 JWT 토큰이 있는지 검사합니다.
+@jwt_required()  # 헤더의 "Bearer [우리 JWT]"를 검사
 def protected():
-    # 토큰이 유효하면, 토큰에 저장된 identity(여기서는 username)를 가져올 수 있습니다.
-    current_user = get_jwt_identity()
-    return jsonify(logged_in_as=current_user), 200
+    # 토큰이 유효하면, identity (email)를 가져옴
+    current_user_email = get_jwt_identity()
+    return jsonify(
+        logged_in_as=current_user_email,
+        message="성공! 이 API는 Google이 아닌 우리 서버의 JWT로 보호됩니다."
+    ), 200
 
 
+# --- 4. 앱 실행 ---
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(debug=True, port=5000)
