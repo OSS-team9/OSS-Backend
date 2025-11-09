@@ -1,5 +1,6 @@
 import os
-from flask import Flask, jsonify, request
+from flask_cors import CORS
+from flask import Flask, jsonify, request, render_template
 from flask_mysqldb import MySQL
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 from dotenv import load_dotenv
@@ -14,6 +15,9 @@ load_dotenv()
 # --- 1. 초기화 ---
 app = Flask(__name__)
 jwt = JWTManager(app)
+
+# 모든 경로(r"/*")에 대해 모든 출처("origins": "*")를 허용
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 # --- 2. 설정 ---
 # DB 설정
@@ -37,7 +41,8 @@ mysql = MySQL(app)
 
 @app.route('/')
 def home():
-    return jsonify({"msg": "Google 로그인 API 서버입니다."})
+    return render_template("index.html")
+    #return jsonify({"msg": "Google 로그인 API 서버입니다."})
 
 
 # [POST] /login/google : 구글 로그인 (회원가입/로그인 통합)
