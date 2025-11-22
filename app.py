@@ -184,6 +184,47 @@ def add_or_update_emotion():
         return jsonify({"error": "서버 내부 오류가 발생했습니다.", "details": str(e)}), 500
 
 
+# [GET] /emotions?date=YYYY-MM-DD : 특정 날짜의 감정 기록 조회
+@app.route('/emotions', methods=['GET'])
+@jwt_required()
+def get_emotion_by_date():
+    """
+    로그인된 사용자의 특정 날짜 감정 기록을 DB에서 조회합니다.
+    """
+    # 1. 사용자 식별
+    current_user_email = get_jwt_identity()
+
+    # 2. 쿼리 파라미터에서 날짜 추출
+    record_date = request.args.get('date')
+
+    # 3. 날짜 파라미터 검증
+    if not record_date:
+        return jsonify({"error": "조회할 날짜를 'date' 쿼리 파라미터로 지정해야 합니다. (예: ?date=YYYY-MM-DD)"}), 400
+
+    try:
+        # 4. 데이터베이스에서 해당 날짜의 감정 기록 조회
+        cur = mysql.connection.cursor()
+        sql = """
+            SELECT record_date, emotion_type, emotion_level
+            FROM user_emotions
+            WHERE user_email = %s AND record_date = %s
+        """
+        cur.execute(sql, (current_user_email, record_date))
+        emotion_record = cur.fetchone()
+        cur.close()
+
+        # 5. 조회 결과에 따라 응답 반환
+        if emotion_record:
+            # 날짜(date) 객체를 문자열로 변환
+            emotion_record['record_date'] = emotion_record['record_date'].strftime('%Y-%m-%d')
+            return jsonify(emotion_record), 200
+        else:
+            return jsonify({"error": "해당 날짜에 대한 감정 기록을 찾을 수 없습니다."}), 404
+
+    except Exception as e:
+        return jsonify({"error": "서버 내부 오류가 발생했습니다.", "details": str(e)}), 500
+
+
 # --- 4. 앱 실행 ---
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
