@@ -124,6 +124,66 @@ def protected():
     ), 200
 
 
+# [POST] /emotions : 감정 기록 추가 또는 업데이트
+@app.route('/emotions', methods=['POST'])
+@jwt_required()
+def add_or_update_emotion():
+    """
+    로그인된 사용자의 특정 날짜 감정 기록을 DB에 추가하거나,
+    기록이 이미 존재하면 업데이트합니다.
+    """
+    # 1. 사용자 식별
+    current_user_email = get_jwt_identity()
+
+    # 2. 요청 본문에서 데이터 추출 (DB 스키마에 맞게)
+    data = request.get_json()
+    record_date = data.get('date') # apiTest.py 와 맞춤
+    emotion_type = data.get('emotion') # apiTest.py 와 맞춤
+    emotion_level = data.get('intensity') # apiTest.py 와 맞춤
+
+    # 3. 필수 데이터 검증
+    if not all([record_date, emotion_type, emotion_level]):
+        return jsonify({"error": "date, emotion, intensity는 필수 항목입니다."}), 400
+
+    try:
+        # 4. 데이터베이스에 삽입 또는 업데이트 (ON DUPLICATE KEY UPDATE 사용)
+        cur = mysql.connection.cursor()
+        sql = """
+            INSERT INTO user_emotions (user_email, record_date, emotion_type, emotion_level)
+            VALUES (%s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                emotion_type = VALUES(emotion_type),
+                emotion_level = VALUES(emotion_level)
+        """
+        cur.execute(sql, (current_user_email, record_date, emotion_type, emotion_level))
+        mysql.connection.commit()
+
+        # 5. 결과에 따라 다른 응답 반환
+        # cursor.rowcount:
+        # - 1: 새 행이 삽입됨 (INSERT)
+        # - 2: 기존 행이 업데이트됨 (UPDATE)
+        # - 0: 기존 행이 동일한 값으로 업데이트 시도됨 (변화 없음)
+        if cur.rowcount == 1:
+            status_code = 201  # Created
+            action = "created"
+            message = "감정 기록이 성공적으로 추가되었습니다."
+        elif cur.rowcount == 2:
+            status_code = 200  # OK
+            action = "updated"
+            message = "감정 기록이 성공적으로 업데이트되었습니다."
+        else: # cur.rowcount == 0
+            status_code = 200  # OK
+            action = "no_change"
+            message = "요청은 처리되었으나, 데이터에 변경 사항이 없습니다."
+
+        cur.close()
+        return jsonify({"action": action, "msg": message}), status_code
+
+    except Exception as e:
+        # 그 외 다른 데이터베이스 오류나 서버 내부 오류
+        return jsonify({"error": "서버 내부 오류가 발생했습니다.", "details": str(e)}), 500
+
+
 # --- 4. 앱 실행 ---
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
