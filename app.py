@@ -306,6 +306,65 @@ def get_emotions():
         return jsonify(state="error", error="서버 내부 오류가 발생했습니다.", details=str(e)), 500
 
 
+# [POST] /image : 특정 날짜의 이미지 업데이트
+@app.route('/image', methods=['POST'])
+@jwt_required()
+def update_image():
+    """
+    로그인된 사용자의 특정 날짜에 해당하는 이미지를 업데이트합니다.
+    해당 날짜에 감정 기록이 먼저 존재해야 합니다.
+    """
+    # 1. 사용자 식별 및 요청 데이터 파싱
+    current_user_email = get_jwt_identity()
+    record_date = request.form.get('date')
+    image_file = request.files.get('image')
+
+    # 2. 필수 데이터 검증
+    if not all([record_date, image_file]):
+        return jsonify(state="error", error="date와 image 파일은 필수 항목입니다."), 400
+
+    # 3. 이미지 파일 저장
+    upload_folder = app.config['UPLOAD_FOLDER']
+    os.makedirs(upload_folder, exist_ok=True)
+    
+    filename = secure_filename(image_file.filename)
+    extension = filename.rsplit('.', 1)[1].lower() if '.' in filename else ''
+    unique_filename = f"{uuid.uuid4()}.{extension}"
+    
+    save_path = os.path.join(upload_folder, unique_filename)
+    image_file.save(save_path)
+    print(f"이미지 저장 완료: {save_path}")
+
+    try:
+        # 4. 데이터베이스 업데이트
+        cur = mysql.connection.cursor()
+        sql = """
+            UPDATE user_emotions
+            SET image_url = %s
+            WHERE user_email = %s AND record_date = %s
+        """
+        cur.execute(sql, (unique_filename, current_user_email, record_date))
+        mysql.connection.commit()
+
+        # 5. 업데이트 결과 확인
+        if cur.rowcount == 0:
+            # 업데이트된 행이 0개이면, 해당 날짜에 레코드가 없다는 의미
+            cur.close()
+            # 방금 저장한 불필요한 파일 삭제
+            os.remove(save_path)
+            print(f"레코드 없어 파일 삭제: {save_path}")
+            return jsonify(state="error", error=f"{record_date}에 해당하는 감정 기록이 없습니다. 먼저 감정 기록을 생성해주세요."), 404
+
+        cur.close()
+        return jsonify(state="success", msg="이미지가 성공적으로 업데이트되었습니다."), 200
+
+    except Exception as e:
+        # 오류 발생 시 저장했던 파일 삭제
+        if os.path.exists(save_path):
+            os.remove(save_path)
+        return jsonify(state="error", error="서버 내부 오류가 발생했습니다.", details=str(e)), 500
+
+
 # --- 4. 앱 실행 ---
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
