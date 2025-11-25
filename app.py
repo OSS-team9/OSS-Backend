@@ -1,4 +1,5 @@
 import os
+import base64
 from flask_cors import CORS
 from flask import Flask, jsonify, request, render_template
 from flask_mysqldb import MySQL
@@ -30,6 +31,9 @@ app.config['MYSQL_CURSORCLASS'] = 'DictCursor'  # 결과를 딕셔너리로 받�
 
 # JWT 설정
 app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY')
+
+# 업로드 폴더 설정
+app.config['UPLOAD_FOLDER'] = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'uploads')
 
 # Google Client ID 설정
 GOOGLE_CLIENT_ID = os.getenv('GOOGLE_CLIENT_ID')
@@ -154,12 +158,13 @@ def add_or_update_emotion():
     if not all([record_date, emotion_type, emotion_level]):
         return jsonify(state="error", error="date, emotion, intensity는 필수 항목입니다."), 400
 
-    image_url = None # 이미지 URL 초기화
+    db_image_filename = None # DB에 저장될 이미지 파일명
 
     # 4. 이미지 파일 처리
     if image_file:
+        upload_folder = app.config['UPLOAD_FOLDER']
         # 업로드 폴더가 없으면 생성
-        os.makedirs('uploads', exist_ok=True)
+        os.makedirs(upload_folder, exist_ok=True)
         
         # 안전한 파일명 생성 (werkzeug.utils.secure_filename 사용)
         filename = secure_filename(image_file.filename)
@@ -167,25 +172,23 @@ def add_or_update_emotion():
         # 파일 확장자 추출
         extension = filename.rsplit('.', 1)[1].lower() if '.' in filename else ''
         
-        # 고유한 파일명 생성 (UUID 사용)
+        # 고유한 파일명 생성 (DB에 저장될 이름)
         unique_filename = f"{uuid.uuid4()}.{extension}"
+        db_image_filename = unique_filename
         
-        # 파일 저장 경로 설정
-        save_path = os.path.join('uploads', unique_filename)
+        # 파일 저장 경로 설정 (절대 경로 사용)
+        save_path = os.path.join(upload_folder, unique_filename)
         
         # 파일 저장
         image_file.save(save_path)
-        
-        # DB에 저장될 파일 경로 (URL)
-        image_url = f"/{save_path}" # 예: /uploads/some_unique_name.jpg
-        print(f"이미지 저장 완료: {image_url}")
+        print(f"이미지 저장 완료: {save_path}")
 
     try:
         # 5. 데이터베이스에 삽입 또는 업데이트
         cur = mysql.connection.cursor()
         
-        if image_url:
-            # 이미지가 있는 경우: image_url 포함하여 INSERT/UPDATE
+        if db_image_filename:
+            # 이미지가 있는 경우: image_url에 파일명만 저장
             sql = """
                 INSERT INTO user_emotions (user_email, record_date, emotion_type, emotion_level, image_url)
                 VALUES (%s, %s, %s, %s, %s)
@@ -194,7 +197,7 @@ def add_or_update_emotion():
                     emotion_level = VALUES(emotion_level),
                     image_url = VALUES(image_url)
             """
-            params = (current_user_email, record_date, emotion_type, emotion_level, image_url)
+            params = (current_user_email, record_date, emotion_type, emotion_level, db_image_filename)
         else:
             # 이미지가 없는 경우: 기존 image_url 필드는 건드리지 않음
             sql = """
@@ -226,8 +229,7 @@ def add_or_update_emotion():
         cur.close()
         
         response_data = {"state": "success", "action": action, "msg": message}
-        if image_url:
-            response_data['image_url'] = image_url # 응답에 이미지 URL 포함
+        # 더 이상 응답에 image_url을 포함하지 않음
 
         return jsonify(response_data), status_code
 
@@ -269,31 +271,39 @@ def get_emotions():
         emotion_records = cur.fetchall()
         cur.close()
 
-        # 5. 조회 결과 가공
+        # 5. 조회 결과 가공 (Base64 인코딩 포함)
         formatted_records = []
         for record in emotion_records:
+            image_data = None
+            if record['image_url']:
+                try:
+                    # DB에 저장된 파일명으로 절대 경로 구성
+                    image_path = os.path.join(app.config['UPLOAD_FOLDER'], record['image_url'])
+                    with open(image_path, 'rb') as image_file:
+                        # 파일을 읽고 Base64로 인코딩
+                        encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+                        
+                        # 파일 확장자에 따른 Data URI 스킴 생성
+                        extension = record['image_url'].rsplit('.', 1)[1].lower()
+                        image_data = f"data:image/{extension};base64,{encoded_string}"
+
+                except FileNotFoundError:
+                    print(f"경고: 파일을 찾을 수 없습니다 - {record['image_url']}")
+                except Exception as e:
+                    print(f"경고: 이미지 처리 중 오류 발생 - {e}")
+
             formatted_records.append({
                 "id": record['id'],
                 "date": record['record_date'].strftime('%Y-%m-%d'),
                 "emotion": record['emotion_type'],
                 "emotionLevel": record['emotion_level'],
-                "imageUrl": record['image_url'] # 이미지 URL 추가
+                "imageData": image_data # URL 대신 Base64 인코딩된 데이터
             })
 
         return jsonify(state="success", data=formatted_records), 200
 
     except Exception as e:
         return jsonify(state="error", error="서버 내부 오류가 발생했습니다.", details=str(e)), 500
-
-
-# [GET] /uploads/<path:filename> : 업로드된 파일 제공
-@app.route('/uploads/<path:filename>')
-def uploaded_file(filename):
-    """
-    'uploads' 디렉토리에서 요청된 파일을 안전하게 제공합니다.
-    """
-    from flask import send_from_directory
-    return send_from_directory('uploads', filename)
 
 
 # --- 4. 앱 실행 ---
