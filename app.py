@@ -126,45 +126,87 @@ def protected():
     ), 200
 
 
-# [POST] /emotions : 감정 기록 추가 또는 업데이트
+# werkzeug 유틸리티 추가
+from werkzeug.utils import secure_filename
+import uuid # 고유한 파일명 생성을 위해 추가
+
+# ... (기존 코드 생략) ...
+
+# [POST] /emotions : 감정 기록 추가 또는 업데이트 (이미지 포함)
 @app.route('/emotions', methods=['POST'])
 @jwt_required()
 def add_or_update_emotion():
     """
     로그인된 사용자의 특정 날짜 감정 기록을 DB에 추가하거나,
-    기록이 이미 존재하면 업데이트합니다.
+    기록이 이미 존재하면 업데이트합니다. 이미지 파일 업로드도 처리합니다.
     """
     # 1. 사용자 식별
     current_user_email = get_jwt_identity()
 
-    # 2. 요청 본문에서 데이터 추출 (DB 스키마에 맞게)
-    data = request.get_json()
-    record_date = data.get('date') # apiTest.py 와 맞춤
-    emotion_type = data.get('emotion') # apiTest.py 와 맞춤
-    emotion_level = data.get('intensity') # apiTest.py 와 맞춤
+    # 2. 요청 데이터에서 텍스트와 파일 추출
+    #    Content-Type이 multipart/form-data 이므로, request.form과 request.files 사용
+    record_date = request.form.get('date')
+    emotion_type = request.form.get('emotion')
+    emotion_level = request.form.get('intensity')
+    image_file = request.files.get('image')
 
     # 3. 필수 데이터 검증
     if not all([record_date, emotion_type, emotion_level]):
         return jsonify(state="error", error="date, emotion, intensity는 필수 항목입니다."), 400
 
+    image_url = None # 이미지 URL 초기화
+
+    # 4. 이미지 파일 처리
+    if image_file:
+        # 안전한 파일명 생성 (werkzeug.utils.secure_filename 사용)
+        filename = secure_filename(image_file.filename)
+        
+        # 파일 확장자 추출
+        extension = filename.rsplit('.', 1)[1].lower() if '.' in filename else ''
+        
+        # 고유한 파일명 생성 (UUID 사용)
+        unique_filename = f"{uuid.uuid4()}.{extension}"
+        
+        # 파일 저장 경로 설정
+        save_path = os.path.join('uploads', unique_filename)
+        
+        # 파일 저장
+        image_file.save(save_path)
+        
+        # DB에 저장될 파일 경로 (URL)
+        image_url = f"/{save_path}" # 예: /uploads/some_unique_name.jpg
+        print(f"이미지 저장 완료: {image_url}")
+
     try:
-        # 4. 데이터베이스에 삽입 또는 업데이트 (ON DUPLICATE KEY UPDATE 사용)
+        # 5. 데이터베이스에 삽입 또는 업데이트
         cur = mysql.connection.cursor()
-        sql = """
-            INSERT INTO user_emotions (user_email, record_date, emotion_type, emotion_level)
-            VALUES (%s, %s, %s, %s)
-            ON DUPLICATE KEY UPDATE
-                emotion_type = VALUES(emotion_type),
-                emotion_level = VALUES(emotion_level)
-        """
-        cur.execute(sql, (current_user_email, record_date, emotion_type, emotion_level))
+        
+        if image_url:
+            # 이미지가 있는 경우: image_url 포함하여 INSERT/UPDATE
+            sql = """
+                INSERT INTO user_emotions (user_email, record_date, emotion_type, emotion_level, image_url)
+                VALUES (%s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    emotion_type = VALUES(emotion_type),
+                    emotion_level = VALUES(emotion_level),
+                    image_url = VALUES(image_url)
+            """
+            params = (current_user_email, record_date, emotion_type, emotion_level, image_url)
+        else:
+            # 이미지가 없는 경우: 기존 image_url 필드는 건드리지 않음
+            sql = """
+                INSERT INTO user_emotions (user_email, record_date, emotion_type, emotion_level)
+                VALUES (%s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    emotion_type = VALUES(emotion_type),
+                    emotion_level = VALUES(emotion_level)
+            """
+            params = (current_user_email, record_date, emotion_type, emotion_level)
+
+        cur.execute(sql, params)
         mysql.connection.commit()
 
-        # 5. 결과에 따라 다른 응답 반환
-        # cursor.rowcount:
-        # - 1: 새 행이 삽입됨 (INSERT)
-        # - 2: 기존 행이 업데이트됨 (UPDATE)
-        # - 0: 기존 행이 동일한 값으로 업데이트 시도됨 (변화 없음)
+        # 6. 결과에 따라 다른 응답 반환
         if cur.rowcount == 1:
             status_code = 201  # Created
             action = "created"
@@ -179,11 +221,17 @@ def add_or_update_emotion():
             message = "요청은 처리되었으나, 데이터에 변경 사항이 없습니다."
 
         cur.close()
-        return jsonify(state="success", action=action, msg=message), status_code
+        
+        response_data = {"state": "success", "action": action, "msg": message}
+        if image_url:
+            response_data['image_url'] = image_url # 응답에 이미지 URL 포함
+
+        return jsonify(response_data), status_code
 
     except Exception as e:
         # 그 외 다른 데이터베이스 오류나 서버 내부 오류
         return jsonify(state="error", error="서버 내부 오류가 발생했습니다.", details=str(e)), 500
+
 
 
 # [GET] /emotions?start_date=YYYY-MM-DD[&end_date=YYYY-MM-DD] : 특정 기간의 감정 기록 조회
@@ -209,7 +257,7 @@ def get_emotions():
         # 4. 데이터베이스에서 해당 기간의 모든 감정 기록 조회
         cur = mysql.connection.cursor()
         sql = """
-            SELECT id, record_date, emotion_type, emotion_level
+            SELECT id, record_date, emotion_type, emotion_level, image_url
             FROM user_emotions
             WHERE user_email = %s AND record_date BETWEEN %s AND %s
             ORDER BY record_date ASC
@@ -225,13 +273,24 @@ def get_emotions():
                 "id": record['id'],
                 "date": record['record_date'].strftime('%Y-%m-%d'),
                 "emotion": record['emotion_type'],
-                "emotionLevel": record['emotion_level']
+                "emotionLevel": record['emotion_level'],
+                "imageUrl": record['image_url'] # 이미지 URL 추가
             })
 
         return jsonify(state="success", data=formatted_records), 200
 
     except Exception as e:
         return jsonify(state="error", error="서버 내부 오류가 발생했습니다.", details=str(e)), 500
+
+
+# [GET] /uploads/<path:filename> : 업로드된 파일 제공
+@app.route('/uploads/<path:filename>')
+def uploaded_file(filename):
+    """
+    'uploads' 디렉토리에서 요청된 파일을 안전하게 제공합니다.
+    """
+    from flask import send_from_directory
+    return send_from_directory('uploads', filename)
 
 
 # --- 4. 앱 실행 ---
