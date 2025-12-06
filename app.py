@@ -158,6 +158,11 @@ def add_or_update_emotion():
     if not all([record_date, emotion_type, emotion_level]):
         return jsonify(state="error", error="date, emotion, intensity는 필수 항목입니다."), 400
 
+    # 3-1. emotion_level(intensity) 값 검증
+    if not emotion_level.isdigit() or int(emotion_level) not in [1, 2, 3]:
+        return jsonify(state="error", error="intensity는 1, 2, 3 중 하나의 정수여야 합니다."), 400
+
+
     db_image_filename = None # DB에 저장될 이미지 파일명
 
     # 4. 이미지 파일 처리
@@ -211,6 +216,18 @@ def add_or_update_emotion():
 
         cur.execute(sql, params)
         mysql.connection.commit()
+
+        # 해금된 감정 기록 (중복 시 무시)
+        try:
+            unlock_sql = """
+                INSERT IGNORE INTO user_unlocked_emotions (user_email, emotion_type, emotion_level)
+                VALUES (%s, %s, %s)
+            """
+            cur.execute(unlock_sql, (current_user_email, emotion_type, emotion_level))
+            mysql.connection.commit()
+        except Exception as unlock_error:
+            # 이 작업이 실패해도 주 기능에 영향을 주지 않도록 로깅만 함
+            print(f"해금 감정 기록 실패: {unlock_error}")
 
         # 6. 결과에 따라 다른 응답 반환
         if cur.rowcount == 1:
@@ -304,6 +321,47 @@ def get_emotions():
 
     except Exception as e:
         return jsonify(state="error", error="서버 내부 오류가 발생했습니다.", details=str(e)), 500
+
+
+# [GET] /unlocked-emotions : 해금된 감정 목록 조회
+@app.route('/unlocked-emotions', methods=['GET'])
+@jwt_required()
+def get_unlocked_emotions():
+    """
+    로그인된 사용자가 현재까지 해금한 감정의 목록과 총 개수를 반환합니다.
+    """
+    current_user_email = get_jwt_identity()
+
+    try:
+        cur = mysql.connection.cursor()
+        sql = """
+            SELECT emotion_type, emotion_level
+            FROM user_unlocked_emotions
+            WHERE user_email = %s
+            ORDER BY unlocked_at ASC
+        """
+        cur.execute(sql, [current_user_email])
+        unlocked_records = cur.fetchall()
+        cur.close()
+
+        # 보기 좋은 형태로 가공
+        formatted_records = [
+            {"emotion": record['emotion_type'], "level": record['emotion_level']}
+            for record in unlocked_records
+        ]
+        
+        # 총 해금 개수와 목록을 함께 반환
+        response_data = {
+            "state": "success",
+            "count": len(formatted_records),
+            "unlocked_emotions": formatted_records
+        }
+
+        return jsonify(response_data), 200
+
+    except Exception as e:
+        return jsonify(state="error", error="서버 내부 오류가 발생했습니다.", details=str(e)), 500
+
 
 
 # [POST] /image : 특정 날짜의 이미지 업데이트
