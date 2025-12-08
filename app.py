@@ -338,7 +338,7 @@ def get_unlocked_emotions():
             SELECT emotion_type, emotion_level
             FROM user_unlocked_emotions
             WHERE user_email = %s
-            ORDER BY unlocked_at ASC
+            ORDER BY emotion_type ASC, emotion_level ASC
         """
         cur.execute(sql, [current_user_email])
         unlocked_records = cur.fetchall()
@@ -361,6 +361,79 @@ def get_unlocked_emotions():
 
     except Exception as e:
         return jsonify(state="error", error="서버 내부 오류가 발생했습니다.", details=str(e)), 500
+
+
+# [POST] /user/representative-emotion : 대표 감정 설정
+@app.route('/user/representative-emotion', methods=['POST'])
+@jwt_required()
+def set_representative_emotion():
+    """
+    로그인된 사용자의 대표 감정을 설정합니다.
+    """
+    current_user_email = get_jwt_identity()
+    data = request.get_json()
+    emotion_type = data.get('emotion_type')
+    emotion_level = data.get('emotion_level')
+
+    if not emotion_type or not emotion_level:
+        return jsonify(state="error", error="emotion_type과 emotion_level은 필수입니다."), 400
+
+    try:
+        cur = mysql.connection.cursor()
+        sql = """
+            UPDATE users
+            SET rep_emotion_type = %s, rep_emotion_level = %s
+            WHERE email = %s
+        """
+        cur.execute(sql, (emotion_type, emotion_level, current_user_email))
+        mysql.connection.commit()
+        cur.close()
+
+        return jsonify(state="success", msg="대표 감정이 성공적으로 설정되었습니다."), 200
+
+    except Exception as e:
+        return jsonify(state="error", error="서버 내부 오류가 발생했습니다.", details=str(e)), 500
+
+
+# [GET] /user/representative-emotion : 대표 감정 조회
+@app.route('/user/representative-emotion', methods=['GET'])
+@jwt_required()
+def get_representative_emotion():
+    """
+    로그인된 사용자의 대표 감정을 조회합니다.
+    """
+    current_user_email = get_jwt_identity()
+
+    try:
+        cur = mysql.connection.cursor()
+        sql = """
+            SELECT rep_emotion_type, rep_emotion_level
+            FROM users
+            WHERE email = %s
+        """
+        cur.execute(sql, [current_user_email])
+        user = cur.fetchone()
+        cur.close()
+
+        if user and user['rep_emotion_type']:
+            response_data = {
+                "state": "success",
+                "emotion_type": user['rep_emotion_type'],
+                "emotion_level": user['rep_emotion_level']
+            }
+        else:
+            response_data = {
+                "state": "success",
+                "emotion_type": None,
+                "emotion_level": None,
+                "msg": "대표 감정이 아직 설정되지 않았습니다."
+            }
+
+        return jsonify(response_data), 200
+
+    except Exception as e:
+        return jsonify(state="error", error="서버 내부 오류가 발생했습니다.", details=str(e)), 500
+
 
 
 
