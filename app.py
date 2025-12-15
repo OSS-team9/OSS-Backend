@@ -5,6 +5,7 @@ from flask import Flask, jsonify, request, render_template
 from flask_mysqldb import MySQL
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 from dotenv import load_dotenv
+from datetime import timedelta
 
 # Google 토큰 검증 라이브러리
 from google.oauth2 import id_token
@@ -31,6 +32,7 @@ app.config['MYSQL_CURSORCLASS'] = 'DictCursor'  # 결과를 딕셔너리로 받�
 
 # JWT 설정
 app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY')
+app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=3)
 
 # 업로드 폴더 설정
 app.config['UPLOAD_FOLDER'] = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'uploads')
@@ -143,12 +145,12 @@ def add_or_update_emotion():
     """
     로그인된 사용자의 특정 날짜 감정 기록을 DB에 추가하거나,
     기록이 이미 존재하면 업데이트합니다. 이미지 파일 업로드도 처리합니다.
+    해금 로직이 포함되어 있어, 하루에 하나의 감정만 해금되도록 관리합니다.
     """
     # 1. 사용자 식별
     current_user_email = get_jwt_identity()
 
     # 2. 요청 데이터에서 텍스트와 파일 추출
-    #    Content-Type이 multipart/form-data 이므로, request.form과 request.files 사용
     record_date = request.form.get('date')
     emotion_type = request.form.get('emotion')
     emotion_level = request.form.get('intensity')
@@ -158,42 +160,40 @@ def add_or_update_emotion():
     if not all([record_date, emotion_type, emotion_level]):
         return jsonify(state="error", error="date, emotion, intensity는 필수 항목입니다."), 400
 
-    # 3-1. emotion_level(intensity) 값 검증
     if not emotion_level.isdigit() or int(emotion_level) not in [1, 2, 3]:
         return jsonify(state="error", error="intensity는 1, 2, 3 중 하나의 정수여야 합니다."), 400
 
+    db_image_filename = None
+    save_path = None # 오류 시 파일 삭제를 위해 경로 저장
 
-    db_image_filename = None # DB에 저장될 이미지 파일명
-
-    # 4. 이미지 파일 처리
+    # 4. 이미지 파일 처리 (DB 트랜잭션 전에 수행)
     if image_file:
         upload_folder = app.config['UPLOAD_FOLDER']
-        # 업로드 폴더가 없으면 생성
         os.makedirs(upload_folder, exist_ok=True)
         
-        # 안전한 파일명 생성 (werkzeug.utils.secure_filename 사용)
         filename = secure_filename(image_file.filename)
-        
-        # 파일 확장자 추출
         extension = filename.rsplit('.', 1)[1].lower() if '.' in filename else ''
-        
-        # 고유한 파일명 생성 (DB에 저장될 이름)
         unique_filename = f"{uuid.uuid4()}.{extension}"
         db_image_filename = unique_filename
         
-        # 파일 저장 경로 설정 (절대 경로 사용)
         save_path = os.path.join(upload_folder, unique_filename)
-        
-        # 파일 저장
         image_file.save(save_path)
         print(f"이미지 저장 완료: {save_path}")
 
+    cur = None # finally 블록에서 사용하기 위해 선언
     try:
-        # 5. 데이터베이스에 삽입 또는 업데이트
+        # 5. 데이터베이스 로직 (단일 트랜잭션으로 처리)
         cur = mysql.connection.cursor()
-        
+
+        # 5-1. 업데이트 전, 이전 감정 기록 조회
+        cur.execute(
+            "SELECT emotion_type, emotion_level FROM user_emotions WHERE user_email = %s AND record_date = %s",
+            (current_user_email, record_date)
+        )
+        old_emotion_record = cur.fetchone()
+
+        # 5-2. 감정 기록 삽입 또는 업데이트
         if db_image_filename:
-            # 이미지가 있는 경우: image_url에 파일명만 저장
             sql = """
                 INSERT INTO user_emotions (user_email, record_date, emotion_type, emotion_level, image_url)
                 VALUES (%s, %s, %s, %s, %s)
@@ -202,9 +202,9 @@ def add_or_update_emotion():
                     emotion_level = VALUES(emotion_level),
                     image_url = VALUES(image_url)
             """
-            params = (current_user_email, record_date, emotion_type, emotion_level, db_image_filename)
+            params = (current_user_email, record_date, emotion_type, int(emotion_level), db_image_filename)
         else:
-            # 이미지가 없는 경우: 기존 image_url 필드는 건드리지 않음
+            # 이미지가 없는 경우, 기존 image_url 필드는 건드리지 않음
             sql = """
                 INSERT INTO user_emotions (user_email, record_date, emotion_type, emotion_level)
                 VALUES (%s, %s, %s, %s)
@@ -212,47 +212,72 @@ def add_or_update_emotion():
                     emotion_type = VALUES(emotion_type),
                     emotion_level = VALUES(emotion_level)
             """
-            params = (current_user_email, record_date, emotion_type, emotion_level)
+            params = (current_user_email, record_date, emotion_type, int(emotion_level))
 
         cur.execute(sql, params)
+        row_count = cur.rowcount # INSERT/UPDATE 결과를 미리 저장
+
+        # 5-3. 해금된 감정 목록(도감) 관리
+        new_emotion_level_int = int(emotion_level)
+        
+        emotion_has_changed = (
+            old_emotion_record and
+            (old_emotion_record['emotion_type'] != emotion_type or
+             old_emotion_record['emotion_level'] != new_emotion_level_int)
+        )
+
+        if emotion_has_changed:
+            old_emotion_type = old_emotion_record['emotion_type']
+            old_emotion_level = old_emotion_record['emotion_level']
+
+            # 이전 감정이 이 기록 외에 다른 날짜에도 사용되는지 확인
+            cur.execute(
+                "SELECT 1 FROM user_emotions WHERE user_email = %s AND emotion_type = %s AND emotion_level = %s LIMIT 1",
+                (current_user_email, old_emotion_type, old_emotion_level)
+            )
+            is_old_emotion_still_in_use = cur.fetchone()
+
+            # 다른 곳에서 사용되지 않는다면 '해금 목록'에서 제거
+            if not is_old_emotion_still_in_use:
+                cur.execute(
+                    "DELETE FROM user_unlocked_emotions WHERE user_email = %s AND emotion_type = %s AND emotion_level = %s",
+                    (current_user_email, old_emotion_type, old_emotion_level)
+                )
+
+        # 5-4. 새로운 감정을 '해금 목록'에 추가 (이미 있으면 무시)
+        cur.execute(
+            "INSERT IGNORE INTO user_unlocked_emotions (user_email, emotion_type, emotion_level) VALUES (%s, %s, %s)",
+            (current_user_email, emotion_type, new_emotion_level_int)
+        )
+
+        # 6. 모든 변경사항을 한번에 커밋
         mysql.connection.commit()
 
-        # 해금된 감정 기록 (중복 시 무시)
-        try:
-            unlock_sql = """
-                INSERT IGNORE INTO user_unlocked_emotions (user_email, emotion_type, emotion_level)
-                VALUES (%s, %s, %s)
-            """
-            cur.execute(unlock_sql, (current_user_email, emotion_type, emotion_level))
-            mysql.connection.commit()
-        except Exception as unlock_error:
-            # 이 작업이 실패해도 주 기능에 영향을 주지 않도록 로깅만 함
-            print(f"해금 감정 기록 실패: {unlock_error}")
-
-        # 6. 결과에 따라 다른 응답 반환
-        if cur.rowcount == 1:
-            status_code = 201  # Created
-            action = "created"
-            message = "감정 기록이 성공적으로 추가되었습니다."
-        elif cur.rowcount == 2:
-            status_code = 200  # OK
-            action = "updated"
-            message = "감정 기록이 성공적으로 업데이트되었습니다."
-        else: # cur.rowcount == 0
-            status_code = 200  # OK
-            action = "no_change"
-            message = "요청은 처리되었으나, 데이터에 변경 사항이 없습니다."
-
-        cur.close()
+        # 7. 결과에 따라 응답 반환
+        if row_count == 1:
+            status_code, action, message = 201, "created", "감정 기록이 성공적으로 추가되었습니다."
+        elif row_count == 2:
+            status_code, action, message = 200, "updated", "감정 기록이 성공적으로 업데이트되었습니다."
+        else: # row_count == 0
+            status_code, action, message = 200, "no_change", "요청은 처리되었으나, 데이터에 변경 사항이 없습니다."
         
-        response_data = {"state": "success", "action": action, "msg": message}
-        # 더 이상 응답에 image_url을 포함하지 않음
-
-        return jsonify(response_data), status_code
+        return jsonify({"state": "success", "action": action, "msg": message}), status_code
 
     except Exception as e:
-        # 그 외 다른 데이터베이스 오류나 서버 내부 오류
+        # DB 오류 발생 시 롤백
+        if mysql.connection:
+            mysql.connection.rollback()
+        
+        # 오류 발생 시 업로드된 파일이 있다면 삭제
+        if save_path and os.path.exists(save_path):
+            os.remove(save_path)
+            print(f"오류로 인해 업로드된 파일 삭제: {save_path}")
+            
         return jsonify(state="error", error="서버 내부 오류가 발생했습니다.", details=str(e)), 500
+    finally:
+        # 커서가 열려있으면 닫기
+        if cur:
+            cur.close()
 
 
 
@@ -491,7 +516,7 @@ def update_image():
 
     except Exception as e:
         # 오류 발생 시 저장했던 파일 삭제
-        if os.path.exists(save_path):
+        if os.path.exists(save_path):gemini
             os.remove(save_path)
         return jsonify(state="error", error="서버 내부 오류가 발생했습니다.", details=str(e)), 500
 
