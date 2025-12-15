@@ -516,7 +516,7 @@ def update_image():
 
     except Exception as e:
         # 오류 발생 시 저장했던 파일 삭제
-        if os.path.exists(save_path):
+        if os.path.exists(save_path):gemini
             os.remove(save_path)
         return jsonify(state="error", error="서버 내부 오류가 발생했습니다.", details=str(e)), 500
 
