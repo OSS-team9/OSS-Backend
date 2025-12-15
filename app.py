@@ -273,6 +273,15 @@ def add_or_update_emotion():
                     "DELETE FROM user_unlocked_emotions WHERE user_email = %s AND emotion_type = %s AND emotion_level = %s",
                     (current_user_email, old_emotion_type, old_emotion_level)
                 )
+                # 만약 삭제된 감정이 대표 감정이었다면, 대표 감정을 NULL로 설정
+                cur.execute(
+                    """
+                    UPDATE users
+                    SET rep_emotion_type = NULL, rep_emotion_level = NULL
+                    WHERE email = %s AND rep_emotion_type = %s AND rep_emotion_level = %s
+                    """,
+                    (current_user_email, old_emotion_type, old_emotion_level)
+                )
 
         # 5-4. 새로운 감정을 '해금 목록'에 추가 (이미 있으면 무시)
         cur.execute(
