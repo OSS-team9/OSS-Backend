@@ -11,6 +11,9 @@ from datetime import timedelta
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 
+# 암호화 라이브러리
+from cryptography.fernet import Fernet, InvalidToken
+
 # .env 파일 로드
 load_dotenv()
 
@@ -39,6 +42,18 @@ app.config['UPLOAD_FOLDER'] = os.path.join(os.path.abspath(os.path.dirname(__fil
 
 # Google Client ID 설정
 GOOGLE_CLIENT_ID = os.getenv('GOOGLE_CLIENT_ID')
+
+# 암호화 설정
+try:
+    ENCRYPTION_KEY = os.getenv('ENCRYPTION_KEY')
+    if ENCRYPTION_KEY:
+        app.config['FERNET'] = Fernet(ENCRYPTION_KEY.encode())
+    else:
+        app.config['FERNET'] = None
+        print("경고: .env 파일에 ENCRYPTION_KEY가 설정되지 않아 이미지 암호화가 비활성화되었습니다.")
+except Exception as e:
+    print(f"오류: ENCRYPTION_KEY가 유효하지 않습니다. 키를 다시 생성하여 .env 파일에 설정해주세요. ({e})")
+    app.config['FERNET'] = None
 
 # 확장 프로그램 초기화
 mysql = MySQL(app)
@@ -145,7 +160,7 @@ def add_or_update_emotion():
     """
     로그인된 사용자의 특정 날짜 감정 기록을 DB에 추가하거나,
     기록이 이미 존재하면 업데이트합니다. 이미지 파일 업로드도 처리합니다.
-    해금 로직이 포함되어 있어, 하루에 하나의 감정만 해금되도록 관리합니다.
+    해금 로직 및 이전 이미지 삭제 로직이 포함되어 있습니다.
     """
     # 1. 사용자 식별
     current_user_email = get_jwt_identity()
@@ -165,9 +180,14 @@ def add_or_update_emotion():
 
     db_image_filename = None
     save_path = None # 오류 시 파일 삭제를 위해 경로 저장
+    old_image_to_delete = None # 삭제할 이전 이미지 파일명
 
-    # 4. 이미지 파일 처리 (DB 트랜잭션 전에 수행)
+    # 4. 이미지 파일 처리 및 암호화 (DB 트랜잭션 전에 수행)
     if image_file:
+        fernet = app.config.get('FERNET')
+        if not fernet:
+            return jsonify(state="error", error="이미지 암호화가 설정되지 않았습니다. 서버 관리자에게 문의하세요."), 500
+
         upload_folder = app.config['UPLOAD_FOLDER']
         os.makedirs(upload_folder, exist_ok=True)
         
@@ -177,20 +197,32 @@ def add_or_update_emotion():
         db_image_filename = unique_filename
         
         save_path = os.path.join(upload_folder, unique_filename)
-        image_file.save(save_path)
-        print(f"이미지 저장 완료: {save_path}")
+        
+        # 이미지를 읽어 메모리에서 암호화 후 저장
+        try:
+            image_data = image_file.read()
+            encrypted_data = fernet.encrypt(image_data)
+            with open(save_path, 'wb') as f:
+                f.write(encrypted_data)
+            print(f"암호화된 이미지 저장 완료: {save_path}")
+        except Exception as e:
+            return jsonify(state="error", error="이미지 처리 중 오류가 발생했습니다.", details=str(e)), 500
 
     cur = None # finally 블록에서 사용하기 위해 선언
     try:
         # 5. 데이터베이스 로직 (단일 트랜잭션으로 처리)
         cur = mysql.connection.cursor()
 
-        # 5-1. 업데이트 전, 이전 감정 기록 조회
+        # 5-1. 업데이트 전, 이전 기록(이미지 포함) 조회
         cur.execute(
-            "SELECT emotion_type, emotion_level FROM user_emotions WHERE user_email = %s AND record_date = %s",
+            "SELECT emotion_type, emotion_level, image_url FROM user_emotions WHERE user_email = %s AND record_date = %s",
             (current_user_email, record_date)
         )
         old_emotion_record = cur.fetchone()
+
+        # 새 이미지로 업데이트하는 경우, 이전 이미지를 삭제 목록에 추가
+        if image_file and old_emotion_record and old_emotion_record.get('image_url'):
+            old_image_to_delete = old_emotion_record['image_url']
 
         # 5-2. 감정 기록 삽입 또는 업데이트
         if db_image_filename:
@@ -230,14 +262,12 @@ def add_or_update_emotion():
             old_emotion_type = old_emotion_record['emotion_type']
             old_emotion_level = old_emotion_record['emotion_level']
 
-            # 이전 감정이 이 기록 외에 다른 날짜에도 사용되는지 확인
             cur.execute(
                 "SELECT 1 FROM user_emotions WHERE user_email = %s AND emotion_type = %s AND emotion_level = %s LIMIT 1",
                 (current_user_email, old_emotion_type, old_emotion_level)
             )
             is_old_emotion_still_in_use = cur.fetchone()
 
-            # 다른 곳에서 사용되지 않는다면 '해금 목록'에서 제거
             if not is_old_emotion_still_in_use:
                 cur.execute(
                     "DELETE FROM user_unlocked_emotions WHERE user_email = %s AND emotion_type = %s AND emotion_level = %s",
@@ -253,7 +283,19 @@ def add_or_update_emotion():
         # 6. 모든 변경사항을 한번에 커밋
         mysql.connection.commit()
 
-        # 7. 결과에 따라 응답 반환
+        # 7. (신규) DB 커밋 후 이전 이미지 파일 삭제
+        if old_image_to_delete:
+            try:
+                old_image_path = os.path.join(app.config['UPLOAD_FOLDER'], old_image_to_delete)
+                if os.path.exists(old_image_path):
+                    os.remove(old_image_path)
+                    print(f"이전 이미지 파일 삭제 완료: {old_image_path}")
+            except Exception as e:
+                # 파일 삭제 실패가 전체 요청에 영향을 주지 않도록 로깅만 함
+                print(f"경고: 이전 이미지 파일 삭제 중 오류 발생 - {e}")
+
+
+        # 8. 결과에 따라 응답 반환
         if row_count == 1:
             status_code, action, message = 201, "created", "감정 기록이 성공적으로 추가되었습니다."
         elif row_count == 2:
@@ -268,7 +310,7 @@ def add_or_update_emotion():
         if mysql.connection:
             mysql.connection.rollback()
         
-        # 오류 발생 시 업로드된 파일이 있다면 삭제
+        # 오류 발생 시 업로드된 '새' 파일이 있다면 삭제
         if save_path and os.path.exists(save_path):
             os.remove(save_path)
             print(f"오류로 인해 업로드된 파일 삭제: {save_path}")
@@ -313,7 +355,8 @@ def get_emotions():
         emotion_records = cur.fetchall()
         cur.close()
 
-        # 5. 조회 결과 가공 (Base64 인코딩 포함)
+        # 5. 조회 결과 가공 (복호화 및 Base64 인코딩 포함)
+        fernet = app.config.get('FERNET')
         formatted_records = []
         for record in emotion_records:
             image_data = None
@@ -321,16 +364,27 @@ def get_emotions():
                 try:
                     # DB에 저장된 파일명으로 절대 경로 구성
                     image_path = os.path.join(app.config['UPLOAD_FOLDER'], record['image_url'])
+                    
                     with open(image_path, 'rb') as image_file:
-                        # 파일을 읽고 Base64로 인코딩
-                        encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
-                        
-                        # 파일 확장자에 따른 Data URI 스킴 생성
-                        extension = record['image_url'].rsplit('.', 1)[1].lower()
-                        image_data = f"data:image/{extension};base64,{encoded_string}"
+                        encrypted_data = image_file.read()
+
+                    # 암호화 키가 있을 경우에만 복호화 시도
+                    if fernet:
+                        decrypted_data = fernet.decrypt(encrypted_data)
+                    else:
+                        # 키가 없으면 암호화되지 않은 원본으로 간주 (하위 호환성)
+                        decrypted_data = encrypted_data
+
+                    encoded_string = base64.b64encode(decrypted_data).decode('utf-8')
+                    
+                    # 파일 확장자에 따른 Data URI 스킴 생성
+                    extension = record['image_url'].rsplit('.', 1)[1].lower()
+                    image_data = f"data:image/{extension};base64,{encoded_string}"
 
                 except FileNotFoundError:
                     print(f"경고: 파일을 찾을 수 없습니다 - {record['image_url']}")
+                except InvalidToken:
+                    print(f"경고: 이미지 복호화 실패 (잘못된 키 또는 암호화되지 않은 파일) - {record['image_url']}")
                 except Exception as e:
                     print(f"경고: 이미지 처리 중 오류 발생 - {e}")
 
@@ -467,7 +521,7 @@ def get_representative_emotion():
 @jwt_required()
 def update_image():
     """
-    로그인된 사용자의 특정 날짜에 해당하는 이미지를 업데이트합니다.
+    로그인된 사용자의 특정 날짜에 해당하는 이미지를 암호화하여 업데이트합니다.
     해당 날짜에 감정 기록이 먼저 존재해야 합니다.
     """
     # 1. 사용자 식별 및 요청 데이터 파싱
@@ -478,8 +532,12 @@ def update_image():
     # 2. 필수 데이터 검증
     if not all([record_date, image_file]):
         return jsonify(state="error", error="date와 image 파일은 필수 항목입니다."), 400
+    
+    fernet = app.config.get('FERNET')
+    if not fernet:
+        return jsonify(state="error", error="이미지 암호화가 설정되지 않았습니다. 서버 관리자에게 문의하세요."), 500
 
-    # 3. 이미지 파일 저장
+    # 3. 이미지 파일 암호화 및 저장
     upload_folder = app.config['UPLOAD_FOLDER']
     os.makedirs(upload_folder, exist_ok=True)
     
@@ -488,8 +546,15 @@ def update_image():
     unique_filename = f"{uuid.uuid4()}.{extension}"
     
     save_path = os.path.join(upload_folder, unique_filename)
-    image_file.save(save_path)
-    print(f"이미지 저장 완료: {save_path}")
+    
+    try:
+        image_data = image_file.read()
+        encrypted_data = fernet.encrypt(image_data)
+        with open(save_path, 'wb') as f:
+            f.write(encrypted_data)
+        print(f"암호화된 이미지 저장 완료: {save_path}")
+    except Exception as e:
+        return jsonify(state="error", error="이미지 처리 중 오류가 발생했습니다.", details=str(e)), 500
 
     try:
         # 4. 데이터베이스 업데이트
@@ -504,9 +569,8 @@ def update_image():
 
         # 5. 업데이트 결과 확인
         if cur.rowcount == 0:
-            # 업데이트된 행이 0개이면, 해당 날짜에 레코드가 없다는 의미
             cur.close()
-            # 방금 저장한 불필요한 파일 삭제
+            # 레코드가 없으면 방금 저장한 불필요한 파일 삭제
             os.remove(save_path)
             print(f"레코드 없어 파일 삭제: {save_path}")
             return jsonify(state="error", error=f"{record_date}에 해당하는 감정 기록이 없습니다. 먼저 감정 기록을 생성해주세요."), 404
@@ -515,8 +579,8 @@ def update_image():
         return jsonify(state="success", msg="이미지가 성공적으로 업데이트되었습니다."), 200
 
     except Exception as e:
-        # 오류 발생 시 저장했던 파일 삭제
-        if os.path.exists(save_path):gemini
+        # DB 오류 발생 시 저장했던 파일 삭제
+        if os.path.exists(save_path):
             os.remove(save_path)
         return jsonify(state="error", error="서버 내부 오류가 발생했습니다.", details=str(e)), 500
 
